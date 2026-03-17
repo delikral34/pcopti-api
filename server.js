@@ -2,32 +2,24 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
-const path = require('path');
 const https = require('https');
 const url = require('url');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'pcopti-secret-key-change-in-production';
-const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || 'https://discord.com/api/webhooks/1483589251667984455/vkrpUVU37a5vOa-Rb1-6WhVAHRtkXqxd2VyxL5UppVsgF-Qft1lrOdBAAYvi0jYN78Rr';
+const JWT_SECRET = process.env.JWT_SECRET || 'pcopti-secret-key';
 
-// DB setup
-const db = new Database(path.join(__dirname, 'users.db'));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+const SUPABASE_URL = 'https://gpvwteflexhwtybigtct.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdwdnd0ZWZsZXhod3R5YmlndGN0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3Mzc3MjY3MiwiZXhwIjoyMDg5MzQ4NjcyfQ.bPE8kmgww7LNnJk-ZJwDDJQpuV1Rx-tZqME5vV6AWBg';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const WEBHOOK_URL = 'https://discord.com/api/webhooks/1483589251667984455/vkrpUVU37a5vOa-Rb1-6WhVAHRtkXqxd2VyxL5UppVsgF-Qft1lrOdBAAYvi0jYN78Rr';
 
 app.use(cors());
 app.use(express.json());
 
-// Discord webhook sender
 function sendLog(embed) {
   const body = JSON.stringify({ embeds: [embed] });
   const parsed = url.parse(WEBHOOK_URL);
@@ -47,11 +39,6 @@ function getIp(req) {
   return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
 }
 
-function timestamp() {
-  return new Date().toISOString();
-}
-
-// Auth middleware
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
@@ -73,7 +60,12 @@ app.post('/api/register', async (req, res) => {
 
   try {
     const hashed = await bcrypt.hash(password, 10);
-    db.prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)').run(username, email, hashed);
+    const { error } = await supabase.from('users').insert({ username, email, password: hashed });
+
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'Username or email already exists' });
+      return res.status(500).json({ error: 'Server error' });
+    }
 
     sendLog({
       title: '📝 New Registration',
@@ -83,17 +75,13 @@ app.post('/api/register', async (req, res) => {
         { name: 'Email', value: email, inline: true },
         { name: 'IP', value: getIp(req), inline: true },
       ],
-      timestamp: timestamp(),
+      timestamp: new Date().toISOString(),
       footer: { text: 'PCOpti Auth' },
     });
 
     res.json({ message: 'Account created successfully' });
   } catch (e) {
-    if (e.message.includes('UNIQUE')) {
-      res.status(409).json({ error: 'Username or email already exists' });
-    } else {
-      res.status(500).json({ error: 'Server error' });
-    }
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -103,17 +91,18 @@ app.post('/api/login', async (req, res) => {
   if (!email || !password)
     return res.status(400).json({ error: 'Email and password required' });
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const { data: users } = await supabase.from('users').select('*').eq('email', email).limit(1);
+  const user = users?.[0];
 
   if (!user || !(await bcrypt.compare(password, user.password))) {
     sendLog({
-      title: '❌ Failed Login Attempt',
+      title: '❌ Failed Login',
       color: 0xff6584,
       fields: [
         { name: 'Email', value: email, inline: true },
         { name: 'IP', value: getIp(req), inline: true },
       ],
-      timestamp: timestamp(),
+      timestamp: new Date().toISOString(),
       footer: { text: 'PCOpti Auth' },
     });
     return res.status(401).json({ error: 'Invalid credentials' });
@@ -129,103 +118,53 @@ app.post('/api/login', async (req, res) => {
       { name: 'Email', value: user.email, inline: true },
       { name: 'IP', value: getIp(req), inline: true },
     ],
-    timestamp: timestamp(),
+    timestamp: new Date().toISOString(),
     footer: { text: 'PCOpti Auth' },
   });
 
   res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
 });
 
-// Log action (optimizer actions)
-app.post('/api/log', authMiddleware, (req, res) => {
-  const { action, details } = req.body;
-
-  const colors = {
-    'RAM Optimize': 0x6c63ff,
-    'Temp Clean': 0x43e97b,
-    'DNS Flush': 0xf7971e,
-  };
-
-  sendLog({
-    title: `⚡ ${action}`,
-    color: colors[action] || 0x6c63ff,
-    fields: [
-      { name: 'User', value: req.user.username, inline: true },
-      { name: 'Email', value: req.user.email, inline: true },
-      { name: 'IP', value: getIp(req), inline: true },
-      ...(details ? [{ name: 'Result', value: details, inline: false }] : []),
-    ],
-    timestamp: timestamp(),
-    footer: { text: 'PCOpti Actions' },
-  });
-
-  res.json({ ok: true });
-});
-
-// Discord OAuth login/register
+// Discord OAuth
 app.post('/api/discord-auth', async (req, res) => {
   const { discordId, username, email, avatar } = req.body;
   if (!discordId) return res.status(400).json({ error: 'Missing discord data' });
 
-  try {
-    let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email || `discord_${discordId}@pcopti.app`);
+  const fakeEmail = email || `discord_${discordId}@pcopti.app`;
+  const { data: existing } = await supabase.from('users').select('*').eq('email', fakeEmail).limit(1);
+  let user = existing?.[0];
 
-    if (!user) {
-      // Auto-register
-      const fakeEmail = email || `discord_${discordId}@pcopti.app`;
-      const fakePass = await bcrypt.hash(discordId + JWT_SECRET, 10);
-      db.prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)').run(username, fakeEmail, fakePass);
-      user = db.prepare('SELECT * FROM users WHERE email = ?').get(fakeEmail);
+  if (!user) {
+    const fakePass = await bcrypt.hash(discordId + JWT_SECRET, 10);
+    let uname = username;
+    const { data: ucheck } = await supabase.from('users').select('id').eq('username', uname).limit(1);
+    if (ucheck?.[0]) uname = `${username}_${discordId.slice(-4)}`;
 
-      sendLog({
-        title: '📝 New Discord Registration',
-        color: 0x5865f2,
-        fields: [
-          { name: 'Username', value: username, inline: true },
-          { name: 'Email', value: email || 'hidden', inline: true },
-          { name: 'Discord ID', value: discordId, inline: true },
-          { name: 'IP', value: getIp(req), inline: true },
-        ],
-        timestamp: timestamp(),
-        footer: { text: 'PCOpti Auth' },
-      });
-    } else {
-      sendLog({
-        title: '✅ Discord Login',
-        color: 0x5865f2,
-        fields: [
-          { name: 'Username', value: username, inline: true },
-          { name: 'IP', value: getIp(req), inline: true },
-        ],
-        timestamp: timestamp(),
-        footer: { text: 'PCOpti Auth' },
-      });
-    }
+    const { data: inserted, error } = await supabase.from('users').insert({ username: uname, email: fakeEmail, password: fakePass }).select().single();
+    if (error) return res.status(500).json({ error: 'Server error' });
+    user = inserted;
 
-    const token = jwt.sign({ id: user.id, username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
-  } catch (e) {
-    if (e.message.includes('UNIQUE')) {
-      // Username taken, append discord id
-      const newUsername = `${username}_${discordId.slice(-4)}`;
-      const fakeEmail = email || `discord_${discordId}@pcopti.app`;
-      const fakePass = await bcrypt.hash(discordId + JWT_SECRET, 10);
-      db.prepare('INSERT OR IGNORE INTO users (username, email, password) VALUES (?, ?, ?)').run(newUsername, fakeEmail, fakePass);
-      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(fakeEmail);
-      const token = jwt.sign({ id: user.id, username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-      res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
-    } else {
-      res.status(500).json({ error: 'Server error' });
-    }
+    sendLog({
+      title: '📝 New Discord Registration',
+      color: 0x5865f2,
+      fields: [
+        { name: 'Username', value: uname, inline: true },
+        { name: 'Discord ID', value: discordId, inline: true },
+        { name: 'IP', value: getIp(req), inline: true },
+      ],
+      timestamp: new Date().toISOString(),
+      footer: { text: 'PCOpti Auth' },
+    });
   }
+
+  const token = jwt.sign({ id: user.id, username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
 });
 
-// Get current user
-app.get('/api/me', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT id, username, email, created_at FROM users WHERE id = ?').get(req.user.id);
-  res.json(user);
+app.get('/api/me', authMiddleware, async (req, res) => {
+  const { data } = await supabase.from('users').select('id, username, email, created_at').eq('id', req.user.id).single();
+  res.json(data);
 });
 
 app.get('/', (req, res) => res.json({ status: 'PCOpti API running' }));
-
 app.listen(PORT, () => console.log(`PCOpti API running on port ${PORT}`));
