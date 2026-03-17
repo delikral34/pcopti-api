@@ -4,10 +4,13 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
 const path = require('path');
+const https = require('https');
+const url = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'pcopti-secret-key-change-in-production';
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || 'https://discord.com/api/webhooks/1483589251667984455/vkrpUVU37a5vOa-Rb1-6WhVAHRtkXqxd2VyxL5UppVsgF-Qft1lrOdBAAYvi0jYN78Rr';
 
 // DB setup
 const db = new Database(path.join(__dirname, 'users.db'));
@@ -24,7 +27,31 @@ db.exec(`
 app.use(cors());
 app.use(express.json());
 
-// Middleware: verify token
+// Discord webhook sender
+function sendLog(embed) {
+  const body = JSON.stringify({ embeds: [embed] });
+  const parsed = url.parse(WEBHOOK_URL);
+  const options = {
+    hostname: parsed.hostname,
+    path: parsed.path,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  };
+  const req = https.request(options);
+  req.on('error', () => {});
+  req.write(body);
+  req.end();
+}
+
+function getIp(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
+}
+
+function timestamp() {
+  return new Date().toISOString();
+}
+
+// Auth middleware
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
@@ -46,8 +73,20 @@ app.post('/api/register', async (req, res) => {
 
   try {
     const hashed = await bcrypt.hash(password, 10);
-    const stmt = db.prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)');
-    stmt.run(username, email, hashed);
+    db.prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)').run(username, email, hashed);
+
+    sendLog({
+      title: '📝 New Registration',
+      color: 0x6c63ff,
+      fields: [
+        { name: 'Username', value: username, inline: true },
+        { name: 'Email', value: email, inline: true },
+        { name: 'IP', value: getIp(req), inline: true },
+      ],
+      timestamp: timestamp(),
+      footer: { text: 'PCOpti Auth' },
+    });
+
     res.json({ message: 'Account created successfully' });
   } catch (e) {
     if (e.message.includes('UNIQUE')) {
@@ -65,13 +104,62 @@ app.post('/api/login', async (req, res) => {
     return res.status(400).json({ error: 'Email and password required' });
 
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
-  const valid = await bcrypt.compare(password, user.password);
-  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    sendLog({
+      title: '❌ Failed Login Attempt',
+      color: 0xff6584,
+      fields: [
+        { name: 'Email', value: email, inline: true },
+        { name: 'IP', value: getIp(req), inline: true },
+      ],
+      timestamp: timestamp(),
+      footer: { text: 'PCOpti Auth' },
+    });
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
 
   const token = jwt.sign({ id: user.id, username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+
+  sendLog({
+    title: '✅ User Login',
+    color: 0x43e97b,
+    fields: [
+      { name: 'Username', value: user.username, inline: true },
+      { name: 'Email', value: user.email, inline: true },
+      { name: 'IP', value: getIp(req), inline: true },
+    ],
+    timestamp: timestamp(),
+    footer: { text: 'PCOpti Auth' },
+  });
+
   res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+});
+
+// Log action (optimizer actions)
+app.post('/api/log', authMiddleware, (req, res) => {
+  const { action, details } = req.body;
+
+  const colors = {
+    'RAM Optimize': 0x6c63ff,
+    'Temp Clean': 0x43e97b,
+    'DNS Flush': 0xf7971e,
+  };
+
+  sendLog({
+    title: `⚡ ${action}`,
+    color: colors[action] || 0x6c63ff,
+    fields: [
+      { name: 'User', value: req.user.username, inline: true },
+      { name: 'Email', value: req.user.email, inline: true },
+      { name: 'IP', value: getIp(req), inline: true },
+      ...(details ? [{ name: 'Result', value: details, inline: false }] : []),
+    ],
+    timestamp: timestamp(),
+    footer: { text: 'PCOpti Actions' },
+  });
+
+  res.json({ ok: true });
 });
 
 // Get current user
