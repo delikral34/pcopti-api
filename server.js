@@ -162,6 +162,64 @@ app.post('/api/log', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
+// Discord OAuth login/register
+app.post('/api/discord-auth', async (req, res) => {
+  const { discordId, username, email, avatar } = req.body;
+  if (!discordId) return res.status(400).json({ error: 'Missing discord data' });
+
+  try {
+    let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email || `discord_${discordId}@pcopti.app`);
+
+    if (!user) {
+      // Auto-register
+      const fakeEmail = email || `discord_${discordId}@pcopti.app`;
+      const fakePass = await bcrypt.hash(discordId + JWT_SECRET, 10);
+      db.prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)').run(username, fakeEmail, fakePass);
+      user = db.prepare('SELECT * FROM users WHERE email = ?').get(fakeEmail);
+
+      sendLog({
+        title: '📝 New Discord Registration',
+        color: 0x5865f2,
+        fields: [
+          { name: 'Username', value: username, inline: true },
+          { name: 'Email', value: email || 'hidden', inline: true },
+          { name: 'Discord ID', value: discordId, inline: true },
+          { name: 'IP', value: getIp(req), inline: true },
+        ],
+        timestamp: timestamp(),
+        footer: { text: 'PCOpti Auth' },
+      });
+    } else {
+      sendLog({
+        title: '✅ Discord Login',
+        color: 0x5865f2,
+        fields: [
+          { name: 'Username', value: username, inline: true },
+          { name: 'IP', value: getIp(req), inline: true },
+        ],
+        timestamp: timestamp(),
+        footer: { text: 'PCOpti Auth' },
+      });
+    }
+
+    const token = jwt.sign({ id: user.id, username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) {
+      // Username taken, append discord id
+      const newUsername = `${username}_${discordId.slice(-4)}`;
+      const fakeEmail = email || `discord_${discordId}@pcopti.app`;
+      const fakePass = await bcrypt.hash(discordId + JWT_SECRET, 10);
+      db.prepare('INSERT OR IGNORE INTO users (username, email, password) VALUES (?, ?, ?)').run(newUsername, fakeEmail, fakePass);
+      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(fakeEmail);
+      const token = jwt.sign({ id: user.id, username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+      res.json({ token, user: { id: user.id, username: user.username, email: user.email } });
+    } else {
+      res.status(500).json({ error: 'Server error' });
+    }
+  }
+});
+
 // Get current user
 app.get('/api/me', authMiddleware, (req, res) => {
   const user = db.prepare('SELECT id, username, email, created_at FROM users WHERE id = ?').get(req.user.id);
